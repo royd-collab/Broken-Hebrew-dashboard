@@ -22,9 +22,10 @@
 
 'use strict';
 
-const https = require('https');
-const fs    = require('fs');
-const path  = require('path');
+const https        = require('https');
+const fs           = require('fs');
+const path         = require('path');
+const { execFile } = require('child_process');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -33,7 +34,7 @@ const CONFIG = {
   anthropicBase: 'api.anthropic.com',
   claudeModel:   'claude-sonnet-4-20250514',
   pageSize:       100,
-  minCustomerTurns: 3,
+  minCustomerTurns: 1,
   delayMs:        300,
 
   // Score thresholds
@@ -62,11 +63,11 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/** ISO date string for the start of today (local midnight → UTC). */
-function todayStart() {
+/** Timestamp (ms) for 7 days ago at local midnight. */
+function weekAgoMs() {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
-  return d.toISOString();
+  return d.getTime() - 7 * 24 * 60 * 60 * 1000;
 }
 
 /** ISO date string for right now. */
@@ -116,28 +117,66 @@ function request(opts, body = null) {
 // ─── Maccabi API calls ────────────────────────────────────────────────────────
 
 /**
- * Fetch a page of communications from the Maccabi sandbox.
+ * Fetch the tenant ID for the given API key from /api/v1/user/details.
+ * The tenant ID must be sent as X-Tenant-ID on all subsequent requests.
  *
  * @param {string} apiKey
- * @param {number} page   - 0-based page index
- * @returns {Promise<object>} - Raw API response
+ * @returns {Promise<string>} tenantId
  */
-async function fetchCommunicationsPage(apiKey, page = 0) {
-  const start  = encodeURIComponent(todayStart());
-  const end    = encodeURIComponent(nowISO());
-  const offset = page * CONFIG.pageSize;
-
-  // Try both common pagination styles (offset and page-based)
-  const qs = `?limit=${CONFIG.pageSize}&offset=${offset}`
-           + `&created_after=${start}&created_before=${end}`
-           + `&sort=created_at:desc`;
-
+async function fetchTenantId(apiKey) {
   const opts = {
     hostname: CONFIG.maccabiBase,
-    path:     `/api/v1/communications${qs}`,
+    path:     '/api/v1/user/details',
     method:   'GET',
     headers: {
       'x-api-key':    apiKey,
+      'Content-Type': 'application/json',
+      'Accept':       'application/json',
+    },
+  };
+
+  const { status, data } = await request(opts);
+
+  if (status !== 200) {
+    throw new Error(`user/details failed: HTTP ${status} – ${JSON.stringify(data).slice(0, 200)}`);
+  }
+
+  const payload = data?.data ?? data;
+  const tenantId = payload?.tenants?.selected;
+  if (!tenantId) {
+    throw new Error('Could not resolve tenant ID from user/details response');
+  }
+  return tenantId;
+}
+
+/**
+ * Fetch a page of communications from the Maccabi sandbox (v2 API).
+ *
+ * @param {string} apiKey
+ * @param {string} tenantId
+ * @param {number} page   - 1-based page index
+ * @returns {Promise<object>} - Raw API response
+ */
+async function fetchCommunicationsPage(apiKey, tenantId, page = 1) {
+  const startMs = weekAgoMs();
+  const endMs   = Date.now();
+
+  const params = new URLSearchParams({
+    filters:   JSON.stringify({ filters: [{ key: 'type', value: 'voice' }] }),
+    startDate: String(startMs),
+    endDate:   String(endMs),
+    page:      String(page),
+    limit:     String(CONFIG.pageSize),
+    sort:      'created_at desc',
+  });
+
+  const opts = {
+    hostname: CONFIG.maccabiBase,
+    path:     `/api/v2/communications?${params.toString()}`,
+    method:   'GET',
+    headers: {
+      'x-api-key':    apiKey,
+      'X-Tenant-ID':  tenantId,
       'Content-Type': 'application/json',
       'Accept':       'application/json',
     },
@@ -169,8 +208,7 @@ function extractCommunicationsList(data) {
  * Determine whether there are more pages to fetch.
  */
 function hasMorePages(data, fetchedSoFar) {
-  // Try common pagination metadata keys
-  const total = data.total ?? data.total_count ?? data.count ?? null;
+  const total = data?.pagination?.total_rows ?? data.total ?? data.total_count ?? data.count ?? null;
   if (total !== null) return fetchedSoFar < total;
 
   // Fall back: if the page was full, assume there might be more
@@ -185,19 +223,22 @@ function hasMorePages(data, fetchedSoFar) {
  * @returns {Promise<object[]>} array of communication objects
  */
 async function fetchTodaysCommunications(apiKey) {
-  console.log('📡 Fetching today\'s conversations from Maccabi…');
+  console.log('📡 Fetching last 7 days of voice conversations from Maccabi…');
+
+  const tenantId = await fetchTenantId(apiKey);
+  console.log(`   Tenant ID: ${tenantId}`);
 
   let all  = [];
-  let page = 0;
+  let page = 1;
 
   while (all.length < CONFIG.pageSize) {
-    const pageData = await fetchCommunicationsPage(apiKey, page);
+    const pageData = await fetchCommunicationsPage(apiKey, tenantId, page);
     const items    = extractCommunicationsList(pageData);
 
     if (items.length === 0) break;
 
     all = all.concat(items);
-    console.log(`   Page ${page + 1}: +${items.length} conversations (total so far: ${all.length})`);
+    console.log(`   Page ${page}: +${items.length} conversations (total so far: ${all.length})`);
 
     if (!hasMorePages(pageData, all.length) || all.length >= CONFIG.pageSize) break;
 
@@ -206,7 +247,7 @@ async function fetchTodaysCommunications(apiKey) {
   }
 
   // Cap at configured max
-  return all.slice(0, CONFIG.pageSize);
+  return { communications: all.slice(0, CONFIG.pageSize), tenantId };
 }
 
 /**
@@ -216,13 +257,14 @@ async function fetchTodaysCommunications(apiKey) {
  * @param {string} id - Conversation ID
  * @returns {Promise<object>} - Full communication object
  */
-async function fetchCommunicationDetail(apiKey, id) {
+async function fetchCommunicationDetail(apiKey, tenantId, id) {
   const opts = {
     hostname: CONFIG.maccabiBase,
-    path:     `/api/v1/communications/${encodeURIComponent(id)}`,
+    path:     `/api/v2/communications/${encodeURIComponent(id)}`,
     method:   'GET',
     headers: {
       'x-api-key':    apiKey,
+      'X-Tenant-ID':  tenantId,
       'Content-Type': 'application/json',
       'Accept':       'application/json',
     },
@@ -245,7 +287,7 @@ async function fetchCommunicationDetail(apiKey, id) {
  */
 function extractTurns(detail) {
   const d = detail.data ?? detail; // unwrap envelope if present
-  return d.transcript ?? d.messages ?? d.turns ?? d.conversation ?? [];
+  return d.transcriptions ?? d.transcript ?? d.messages ?? d.turns ?? d.conversation ?? [];
 }
 
 /** Normalise a single turn to { role, text }. */
@@ -334,17 +376,17 @@ function stripCodeFences(str) {
 
 /**
  * Call Claude to score the Hebrew transcription quality of customer turns.
+ * Uses the `claude` CLI via subprocess so Claude Code's subscription is used.
  *
- * @param {string}   anthropicKey
  * @param {string[]} customerTurns - Array of customer utterance strings
  * @returns {Promise<object>} - Parsed scoring object from Claude
  */
-async function scoreHebrewQuality(anthropicKey, customerTurns) {
+async function scoreHebrewQuality(customerTurns) {
   const turnsText = customerTurns
     .map((t, i) => `Turn ${i + 1}: ${t}`)
     .join('\n');
 
-  const systemPrompt = `You are a Hebrew language quality analyst specialising in speech-to-text transcription errors.
+  const prompt = `You are a Hebrew language quality analyst specialising in speech-to-text transcription errors.
 You will receive the customer-side turns of a voice call transcribed by an automatic speech recognition (ASR) system.
 The audio comes from real phone calls with background noise, poor quality, and non-native speakers, so the transcription may contain errors.
 
@@ -357,39 +399,37 @@ Analyse the transcription quality and return ONLY a valid JSON object — no pro
   "cleaned_version": <string — your best reconstruction in correct Hebrew of what the customer most likely said in that worst turn>,
   "agent_confusion_likely": <boolean — true if the transcription errors are severe enough that a voice agent would struggle to understand>,
   "summary": <string — one sentence in English describing the overall transcription quality>
-}`;
+}
 
-  const userMessage = `Here are the customer-side turns from this conversation:\n\n${turnsText}`;
+Here are the customer-side turns from this conversation:
 
-  const payload = JSON.stringify({
-    model: CONFIG.claudeModel,
-    max_tokens: 1024,
-    system: systemPrompt,
-    messages: [
-      { role: 'user', content: userMessage },
-    ],
+${turnsText}`;
+
+  const claudeBin = process.env.CLAUDE_BIN || '/opt/homebrew/bin/claude';
+
+  const rawText = await new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    delete env.CLAUDECODE;
+    env.PATH = `/opt/homebrew/bin:${env.PATH || ''}`;
+
+    const child = require('child_process').spawn(
+      claudeBin,
+      ['-p', '-', '--model', CONFIG.claudeModel],
+      { env, timeout: 60000 }
+    );
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => (stdout += d));
+    child.stderr.on('data', d => (stderr += d));
+    child.on('close', code => {
+      if (code !== 0) return reject(new Error(`claude CLI exited ${code}: ${stderr.slice(0, 300)}`));
+      resolve(stdout.trim());
+    });
+    child.on('error', reject);
+    child.stdin.write(prompt);
+    child.stdin.end();
   });
-
-  const opts = {
-    hostname: CONFIG.anthropicBase,
-    path:     '/v1/messages',
-    method:   'POST',
-    headers: {
-      'x-api-key':         anthropicKey,
-      'anthropic-version': '2023-06-01',
-      'Content-Type':      'application/json',
-      'Content-Length':    Buffer.byteLength(payload),
-    },
-  };
-
-  const { status, data } = await request(opts, payload);
-
-  if (status !== 200) {
-    throw new Error(`Claude API error: HTTP ${status} – ${JSON.stringify(data).slice(0, 300)}`);
-  }
-
-  // Extract the text content from the Anthropic messages response
-  const rawText = data?.content?.[0]?.text ?? '';
 
   if (!rawText) {
     throw new Error('Claude returned an empty response');
@@ -404,14 +444,13 @@ Analyse the transcription quality and return ONLY a valid JSON object — no pro
     throw new Error(`Failed to parse Claude JSON response: ${e.message}\nRaw: ${rawText.slice(0, 500)}`);
   }
 
-  // Validate and normalise the scoring object
   return {
-    quality_score:         Number(parsed.quality_score ?? 0),
-    error_types:           Array.isArray(parsed.error_types) ? parsed.error_types : [],
-    worst_turn_text:       parsed.worst_turn_text ?? '',
-    cleaned_version:       parsed.cleaned_version ?? '',
+    quality_score:          Number(parsed.quality_score ?? 0),
+    error_types:            Array.isArray(parsed.error_types) ? parsed.error_types : [],
+    worst_turn_text:        parsed.worst_turn_text ?? '',
+    cleaned_version:        parsed.cleaned_version ?? '',
     agent_confusion_likely: Boolean(parsed.agent_confusion_likely ?? false),
-    summary:               parsed.summary ?? '',
+    summary:                parsed.summary ?? '',
   };
 }
 
@@ -444,42 +483,26 @@ async function main() {
     process.exit(1);
   }
 
-  // Resolve Anthropic auth: explicit key → enterprise session token → error
-  let anthropicKey = process.env.ANTHROPIC_API_KEY;
-  if (!anthropicKey) {
-    const tokenFile = process.env.CLAUDE_SESSION_INGRESS_TOKEN_FILE;
-    if (tokenFile) {
-      try {
-        anthropicKey = fs.readFileSync(tokenFile, 'utf8').trim();
-        console.log('Using Claude Code enterprise session token for Anthropic auth.');
-      } catch (e) {
-        console.error(`ERROR: Could not read session token from ${tokenFile}: ${e.message}`);
-        process.exit(1);
-      }
-    } else {
-      console.error(
-        'ERROR: No Anthropic auth found.\n' +
-        '  Set ANTHROPIC_API_KEY, or run inside Claude Code (enterprise session token auto-detected).'
-      );
-      process.exit(1);
-    }
-  }
+  // Claude scoring uses the `claude` CLI (your subscription) via subprocess.
+  // No ANTHROPIC_API_KEY needed.
 
   const reportDate = todayDateString();
+  const fromDate   = new Date(weekAgoMs()).toISOString().split('T')[0];
   console.log(`\n══════════════════════════════════════════════════════`);
-  console.log(` Hebrew Transcription QA — ${reportDate}`);
+  console.log(` Hebrew Voice Transcription QA — ${fromDate} → ${reportDate}`);
   console.log(`══════════════════════════════════════════════════════\n`);
 
   // ── Step 1: Fetch today's conversations ───────────────────────────────────
   let communications;
+  let tenantId;
   try {
-    communications = await fetchTodaysCommunications(maccabiKey);
+    ({ communications, tenantId } = await fetchTodaysCommunications(maccabiKey));
   } catch (err) {
     console.error(`FATAL: Could not fetch communications list: ${err.message}`);
     process.exit(1);
   }
 
-  console.log(`\nFound ${communications.length} conversation(s) today.\n`);
+  console.log(`\nFound ${communications.length} voice conversation(s) in the last 7 days.\n`);
 
   if (communications.length === 0) {
     console.log('No conversations to analyse. Exiting.');
@@ -499,7 +522,7 @@ async function main() {
 
     try {
       // Step 2 – Fetch full transcript
-      const detail = await fetchCommunicationDetail(maccabiKey, id);
+      const detail = await fetchCommunicationDetail(maccabiKey, tenantId, id);
       const { customerTurns, agentTurns } = parseTurns(detail);
 
       if (customerTurns.length < CONFIG.minCustomerTurns) {
@@ -510,7 +533,7 @@ async function main() {
       }
 
       // Step 3 – Score Hebrew quality
-      const scoring = await scoreHebrewQuality(anthropicKey, customerTurns);
+      const scoring = await scoreHebrewQuality(customerTurns);
 
       // Step 4 – Detect agent confusion
       const confusion = detectAgentConfusion(agentTurns);
@@ -556,7 +579,7 @@ async function main() {
 
   // Console dashboard
   console.log(`\n══════════════════════════════════════════════════════`);
-  console.log(` QA Dashboard — ${reportDate}`);
+  console.log(` QA Dashboard — ${fromDate} → ${reportDate}  (voice only)`);
   console.log(`══════════════════════════════════════════════════════`);
   console.log(`  Total analysed : ${results.length}  (skipped: ${skipped}, errors: ${errors})`);
   console.log(`  Average score  : ${avgScore}/100`);
@@ -594,9 +617,11 @@ async function main() {
   // JSON report
   const report = {
     report_date: reportDate,
+    report_from: fromDate,
+    type_filter: 'voice',
     generated_at: nowISO(),
     summary: {
-      total_conversations_today:  communications.length,
+      total_voice_conversations:  communications.length,
       total_analysed:             results.length,
       total_skipped_short:        skipped,
       total_errors:               errors,
