@@ -8,11 +8,16 @@
  * outputs a tiered dashboard + JSON report.
  *
  * Usage:
- *   MACCABI_API_KEY=<key> ANTHROPIC_API_KEY=<key> node hebrew_qa.js
+ *   MACCABI_API_KEY=<key> node hebrew_qa.js
  *
  * Required env vars:
  *   MACCABI_API_KEY   – Wonderful AI / Maccabi sandbox API key
- *   ANTHROPIC_API_KEY – Anthropic API key for Claude scoring
+ *
+ * Optional env vars:
+ *   ANTHROPIC_API_KEY – Explicit Anthropic API key. When omitted the script
+ *                       automatically uses the Claude Code enterprise session
+ *                       token from CLAUDE_SESSION_INGRESS_TOKEN_FILE (set by
+ *                       the Claude Code runtime — no manual key needed).
  */
 
 'use strict';
@@ -432,16 +437,32 @@ function conversationLink(id) {
 
 async function main() {
   // Validate required environment variables up-front
-  const maccabiKey   = process.env.MACCABI_API_KEY;
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  const maccabiKey = process.env.MACCABI_API_KEY;
 
   if (!maccabiKey) {
     console.error('ERROR: MACCABI_API_KEY environment variable is not set.');
     process.exit(1);
   }
+
+  // Resolve Anthropic auth: explicit key → enterprise session token → error
+  let anthropicKey = process.env.ANTHROPIC_API_KEY;
   if (!anthropicKey) {
-    console.error('ERROR: ANTHROPIC_API_KEY environment variable is not set.');
-    process.exit(1);
+    const tokenFile = process.env.CLAUDE_SESSION_INGRESS_TOKEN_FILE;
+    if (tokenFile) {
+      try {
+        anthropicKey = fs.readFileSync(tokenFile, 'utf8').trim();
+        console.log('Using Claude Code enterprise session token for Anthropic auth.');
+      } catch (e) {
+        console.error(`ERROR: Could not read session token from ${tokenFile}: ${e.message}`);
+        process.exit(1);
+      }
+    } else {
+      console.error(
+        'ERROR: No Anthropic auth found.\n' +
+        '  Set ANTHROPIC_API_KEY, or run inside Claude Code (enterprise session token auto-detected).'
+      );
+      process.exit(1);
+    }
   }
 
   const reportDate = todayDateString();
