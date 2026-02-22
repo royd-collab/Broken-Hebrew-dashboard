@@ -41,7 +41,7 @@ const CONFIG = {
   warnedBelow:   65,   // >= 65 is Clean
 
   // Wonderful platform base URL for direct conversation links
-  wonderfulAppBase: 'https://wonderful.ai/dashboard/communications',
+  wonderfulAppBase: 'https://maccabi.app.sb.wonderful.ai/activities',
 
   // Hebrew/English confusion phrases the agent uses when it doesn't understand
   confusionPhrases: [
